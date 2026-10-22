@@ -573,7 +573,8 @@ extension PocketTtsSynthesizer {
         bosEmb: MLMultiArray,
         state: inout KVCacheState,
         model: MLModel,
-        layerKeys: PocketTtsLayerKeys
+        layerKeys: PocketTtsLayerKeys,
+        cacheBackings: [String: MLMultiArray]? = nil
     ) async throws -> (transformerOut: MLMultiArray, eosLogit: Float) {
         try validateKVCacheCapacity(
             currentPosition: try kvCachePosition(in: state), additionalPositions: 1)
@@ -595,7 +596,10 @@ extension PocketTtsSynthesizer {
         addCacheInputs(&inputDict, state: state, layers: layers)
 
         let input = try MLDictionaryFeatureProvider(dictionary: inputDict)
-        let output = try await model.compatPrediction(from: input, options: MLPredictionOptions())
+        let options = MLPredictionOptions()
+        // The new caches go into arrays the caller keeps, rather than into new ones at every step.
+        if let cacheBackings { options.outputBackings = cacheBackings }
+        let output = try await model.compatPrediction(from: input, options: options)
 
         // Extract transformer output
         guard let transformerOut = output.featureValue(for: transformerKey)?.multiArrayValue
