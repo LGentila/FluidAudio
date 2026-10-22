@@ -76,6 +76,29 @@ public actor PocketTtsSession {
     private let voiceCachePosition: Int
     private var mimiState: PocketTtsSynthesizer.MimiState
     private var rng: SeededRNG
+    /// Two sets of FlowLM cache outputs, written in turn: one holds a step's input caches while the other receives its
+    /// outputs. Without them, CoreML allocates the 24 caches anew at every step (96 MB per 80 ms frame for 24L packs).
+    private var cacheBackings: [[String: MLMultiArray]] = []
+    private var cacheBackingTurn = 0
+
+    private func nextCacheBackings(
+        layerKeys: PocketTtsLayerKeys, model: MLModel, like state: PocketTtsSynthesizer.KVCacheState
+    ) throws -> [String: MLMultiArray]? {
+        guard !layerKeys.isSplitKV else { return nil }
+        if cacheBackings.isEmpty {
+            let outputs = model.modelDescription.outputDescriptionsByName
+            cacheBackings = try (0..<2).map { _ in
+                var set: [String: MLMultiArray] = [:]
+                for (i, key) in layerKeys.cacheKeys.enumerated() {
+                    let type = outputs[key]?.multiArrayConstraint?.dataType ?? .float32
+                    set[key] = try MLMultiArray(shape: state.caches[i].shape, dataType: type)
+                }
+                return set
+            }
+        }
+        cacheBackingTurn ^= 1
+        return cacheBackings[cacheBackingTurn]
+    }
 
     // Stateful (`.aneState`) path — mobius Trial 23 MLState pipeline.
     // `stateEngineRef` / `stateVoiceSnapshotRef` are lazily created on the
@@ -323,12 +346,15 @@ public actor PocketTtsSession {
 
             // FlowLM step. `kvState` is function-local (not actor-isolated),
             // so it can be passed `inout` to the async free function directly.
+            nonisolated(unsafe) let backings = try nextCacheBackings(
+                layerKeys: flowlmLayerKeys, model: stepModel, like: kvState)
             let (transformerOut, eosLogit) = try await PocketTtsSynthesizer.runFlowLMStep(
                 sequence: sequence,
                 bosEmb: bosEmb,
                 state: &kvState,
                 model: stepModel,
-                layerKeys: flowlmLayerKeys
+                layerKeys: flowlmLayerKeys,
+                cacheBackings: backings
             )
 
             // EOS detection
